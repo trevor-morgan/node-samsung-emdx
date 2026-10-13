@@ -4,7 +4,6 @@ import { execFileSync } from 'child_process';
 import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
-import path from 'path';
 
 import { Device } from '@weejewel/samsung-mdc';
 import express from 'express';
@@ -12,6 +11,13 @@ import getPort from 'get-port';
 import getLocalIp from '@loxjs/node-local-ip';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
+
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+import { findMdcHosts } from '../lib/discover.mjs';
+import { EmdxBle } from '../lib/emdx-ble.mjs';
+import { ask, askHidden } from '../lib/prompt.mjs';
 
 /** Returns this machine's IPv4 address on the same subnet as `host`, if any. */
 function localIpFor(host) {
@@ -36,6 +42,14 @@ function preparePng(image) {
   const out = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'emdx-png-')), 'image.png');
   execFileSync('sips', ['-s', 'format', 'png', image, '--out', out], { stdio: 'ignore' });
   return out;
+}
+
+/** Explains a failed PIN handshake. */
+function pinRejected(result) {
+  return result === 'AUTH_FAILED'
+    ? 'The display rejected the PIN. Use the 6-digit code shown on the display right now; '
+      + 'it changes each time the display enters Bluetooth pairing mode.'
+    : `The display did not accept the PIN (${result}).`;
 }
 
 yargs(hideBin(process.argv))
@@ -183,5 +197,88 @@ yargs(hideBin(process.argv))
       }, argv.timeout * 1000).unref?.();
     },
   })
+  .command({
+    command: 'ble-status',
+    describe: 'Read a display\'s setup status over Bluetooth (macOS)',
+    builder: yargs => yargs
+      .option('pin', { type: 'string', describe: '6-digit PIN shown on the display' })
+      .option('name', { type: 'string', default: 'EMDX', describe: 'Part of the display\'s Bluetooth name' })
+      .option('debug', { type: 'boolean', default: false }),
+    handler: async (argv) => {
+      const pin = argv.pin ?? await ask('PIN shown on the display: ');
+      const session = new EmdxBle({ nameFilter: argv.name, debug: argv.debug });
+      try {
+        console.log(`🔄 Connecting over Bluetooth...`);
+        console.log(`✅ Connected to ${await session.connect()}`);
+        const auth = await session.authorize(pin);
+        if (!['SUCCESS', 'ALREADY_AUTHORIZED'].includes(auth)) throw new Error(pinRejected(auth));
+        console.log('✅ PIN accepted');
+        console.log('Wi-Fi network:', (await session.configuredSsid()) || '(none)');
+        console.log('Network:', await session.networkAddress());
+        console.log('Status:', await session.deviceStatus());
+      } finally {
+        await session.close();
+      }
+    },
+  })
+  .command({
+    command: 'setup',
+    describe: 'Join a display to your Wi-Fi over Bluetooth (macOS), like Samsung\'s E-Paper app',
+    builder: yargs => yargs
+      .option('pin', { type: 'string', describe: '6-digit PIN shown on the display\'s setup screen' })
+      .option('ssid', { type: 'string', describe: 'Wi-Fi network name' })
+      .option('name', { type: 'string', default: 'EMDX', describe: 'Part of the display\'s Bluetooth name' })
+      .option('debug', { type: 'boolean', default: false }),
+    handler: async (argv) => {
+      const pin = argv.pin ?? await ask('PIN shown on the display: ');
+      if (!/^\d{6}$/.test(pin)) throw new Error('The PIN must be the 6 digits shown on the display.');
+      const ssid = argv.ssid ?? await ask('Wi-Fi network name (SSID): ');
+      if (!ssid) throw new Error('A Wi-Fi network name is required.');
+      // The password is never taken as an argument, so it stays out of shell history.
+      const password = process.env.EMDX_WIFI_PASSWORD ?? await askHidden(`Password for "${ssid}" (hidden, leave empty for an open network): `);
+
+      const session = new EmdxBle({ nameFilter: argv.name, debug: argv.debug });
+      try {
+        console.log('🔄 Connecting over Bluetooth...');
+        console.log(`✅ Connected to ${await session.connect()}`);
+        const auth = await session.authorize(pin);
+        if (!['SUCCESS', 'ALREADY_AUTHORIZED'].includes(auth)) throw new Error(pinRejected(auth));
+        console.log('✅ PIN accepted');
+
+        await session.joinWifi(ssid, password, msg => console.log(`✅ ${msg}`));
+        console.log('🔄 Waiting for the display to join the network...');
+        let ip = null;
+        try {
+          const net = await session.waitForIp();
+          if (net?.ip && net.ip !== '0.0.0.0') ip = net.ip;
+        } catch (e) {
+          // The display may drop Bluetooth once it switches to Wi-Fi.
+          console.log(`⚠️  Bluetooth ended before the display reported its address (${e.message}).`);
+        }
+        if (!ip) {
+          console.log('🔄 Looking for the display on this Mac\'s network (Samsung control port 1515)...');
+          const hosts = await findMdcHosts();
+          if (hosts.length === 1) ip = hosts[0];
+          else if (hosts.length > 1) console.log(`Found several Samsung-control hosts: ${hosts.join(', ')}`);
+        }
+        if (!ip) {
+          throw new Error('The display did not show up on the network. Check the Wi-Fi password and that this '
+            + 'Mac is on the same network, then run setup again (2.4 GHz networks are the most reliable).');
+        }
+        console.log(`✅ Display is on Wi-Fi at ${ip}`);
+        console.log('');
+        console.log('Show an image with:');
+        console.log(`  node ${path.join(path.dirname(fileURLToPath(import.meta.url)), 'index.mjs')} show-image --host ${ip} --pin <PIN> --image <file.jpg>`);
+      } finally {
+        await session.close();
+      }
+    },
+  })
   .demandCommand()
+  .fail((msg, err, y) => {
+    // Show usage only for argument mistakes; runtime failures get one clear line.
+    if (err) console.error(`❌ ${err.message}`);
+    else { y.showHelp(); console.error(`\n${msg}`); }
+    process.exit(1);
+  })
   .parse();
